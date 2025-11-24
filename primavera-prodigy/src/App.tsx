@@ -62,9 +62,6 @@ function App() {
         <div className="header-content">
           <div className="header-left">
             <div className="logo-container">
-              <div className="logo-icon">
-                <span>P</span>
-              </div>
               <h1 className="app-title">Primavera Prodigy</h1>
             </div>
           </div>

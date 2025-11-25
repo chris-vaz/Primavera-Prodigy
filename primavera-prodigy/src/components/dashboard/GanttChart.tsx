@@ -1,259 +1,467 @@
-import React, { useRef, useEffect, useState, useMemo } from 'react';
-import { select, scaleTime, extent, timeDay, timeFormat } from 'd3';
-import { useProjectStore } from '../../store/useProjectStore';
-import { useFilteredActivities } from '../../hooks/useFilteredActivities';
-import type { P6Activity } from '../../lib/xer-parser/types';
+import React, { useEffect, useRef, useCallback, useState } from "react";
+import { useFilteredActivities } from "../../hooks/useFilteredActivities";
+import { useProjectStore } from "../../store/useProjectStore";
 
-// Constants
-const ROW_HEIGHT = 30;
-const MARGIN = { top: 20, right: 30, bottom: 20, left: 10 };
-const DATE_FORMAT = timeFormat('%b %d');
-const MIN_BAR_WIDTH = 2;
-const ARROW_MARKER_ID = 'gantt-arrowhead';
-
-// Helpers
-const parseP6Date = (dateString?: string): Date => {
-    if (!dateString) return new Date();
-    return new Date(dateString.split(' ')[0] + 'T00:00:00');
-};
-
-const getProjectDateExtent = (activities: P6Activity[]): [Date, Date] => {
-    const dates: Date[] = [];
-    activities.forEach(a => {
-        if (a.early_start_date) dates.push(parseP6Date(a.early_start_date));
-        if (a.early_end_date) dates.push(parseP6Date(a.early_end_date));
-    });
-
-    const [minDate, maxDate] = extent(dates) as [Date, Date];
-
-    if (!minDate || !maxDate) {
-        const today = new Date();
-        return [timeDay.offset(today, -15), timeDay.offset(today, 15)];
-    }
-
-    const extendedMin = timeDay.offset(minDate, -15);
-    const extendedMax = timeDay.offset(maxDate, 15);
-    return [extendedMin, extendedMax];
-};
+/**
+ * GanttChart (amCharts5) with dependency lines overlay.
+ * - Theme A (dark): white labels & faint white gridlines
+ * - Full tooltip from `raw` activity
+ * - Loading spinner while chart initializes
+ *
+ * NOTE: Add amCharts CDN scripts to public/index.html:
+ * <script src="https://cdn.amcharts.com/lib/5/index.js"></script>
+ * <script src="https://cdn.amcharts.com/lib/5/xy.js"></script>
+ * <script src="https://cdn.amcharts.com/lib/5/themes/Animated.js"></script>
+ *
+ * Provide CSS for classes used (loader, wrapper, overlay...) in your external stylesheet.
+ */
 
 const GanttChart: React.FC = () => {
-    const svgRef = useRef<SVGSVGElement | null>(null);
-    const containerRef = useRef<HTMLDivElement | null>(null);
-    const activities = useFilteredActivities();
-    const projectData = useProjectStore(state => state.projectData);
-    const relationships = projectData?.relationships ?? [];
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const chartDivRef = useRef<HTMLDivElement | null>(null);
+  const overlayRef = useRef<SVGSVGElement | null>(null);
+  const amRootRef = useRef<any | null>(null);
 
-    const [chartWidth, setChartWidth] = useState<number>(0);
+  const activities = useFilteredActivities();
+  const projectData = useProjectStore((s) => s.projectData);
+  const relationships = projectData?.relationships ?? [];
 
-    const activitiesCount = activities.length;
-    const height = activitiesCount * ROW_HEIGHT + MARGIN.top + MARGIN.bottom;
-    const chartHeight = Math.max(activitiesCount * ROW_HEIGHT, ROW_HEIGHT);
+  const [loading, setLoading] = useState<boolean>(true);
 
-    const [minDate, maxDate] = useMemo(() => getProjectDateExtent(activities), [activities]);
+  // convert activity -> amCharts friendly data
+  const chartData = activities.map((a, i) => {
+    const startDate = a.early_start_date
+      ? new Date(a.early_start_date.split(" ")[0] + "T00:00:00")
+      : new Date();
+    const endDate = a.early_end_date
+      ? new Date(a.early_end_date.split(" ")[0] + "T00:00:00")
+      : new Date(startDate.getTime() + 24 * 3600 * 1000);
+    const isCritical = Number(a.total_float) <= 0;
+    return {
+      id: a.task_id,
+      task: a.task_code || a.task_name || `Task ${i + 1}`,
+      name: a.task_name || "",
+      start: startDate.getTime(),
+      end: endDate.getTime(),
+      color: isCritical ? "#ef4444" : "#22c55e",
+      critical: isCritical,
+      raw: a,
+    };
+  });
 
-    useEffect(() => {
-        if (!containerRef.current) return;
-        const el = containerRef.current;
-        let timeout: number | null = null;
+  // helper: amCharts on window (CDN)
+  const getAm5 = useCallback(() => (window as any).am5, []);
+  const getAm5xy = useCallback(() => (window as any).am5xy, []);
+  const getAm5themes = useCallback(() => (window as any).am5themes_Animated, []);
 
-        const ro = new ResizeObserver(() => {
-            if (timeout) window.clearTimeout(timeout);
-            timeout = window.setTimeout(() => {
-                const rect = el.getBoundingClientRect();
-                const inner = Math.max(100, rect.width - MARGIN.left - MARGIN.right - 20);
-                setChartWidth(inner);
-            }, 120);
-        });
+  useEffect(() => {
+    const am5 = getAm5();
+    const am5xy = getAm5xy();
+    const am5themes = getAm5themes();
 
-        ro.observe(el);
+    if (!am5 || !am5xy) {
+      console.error(
+        "amCharts not found on window. Make sure you added CDN scripts to index.html."
+      );
+      return;
+    }
+    if (!chartDivRef.current) return;
 
-        const rect = el.getBoundingClientRect();
-        setChartWidth(Math.max(100, rect.width - MARGIN.left - MARGIN.right - 20));
+    // show loader while building chart
+    setLoading(true);
 
-        return () => {
-            ro.disconnect();
-            if (timeout) window.clearTimeout(timeout);
-        };
-    }, []);
+    // create root
+    const root = am5.Root.new(chartDivRef.current);
+    amRootRef.current = root;
 
-    const xScale = useMemo(() => {
-        if (!minDate || !maxDate || chartWidth <= 0) return null;
-        return scaleTime().domain([minDate, maxDate]).range([0, chartWidth]);
-    }, [minDate, maxDate, chartWidth]);
+    // dark theme + animated
+    root.setThemes([am5themes.new(root)]);
 
-    useEffect(() => {
-        if (!xScale || chartWidth <= 0 || activitiesCount === 0) {
-            const svg = select(svgRef.current);
-            svg.selectAll('*').remove();
-            return;
-        }
-
-        const svg = select(svgRef.current);
-        svg.selectAll('*').remove();
-
-        svg.attr('width', chartWidth + MARGIN.left + MARGIN.right).attr('height', height);
-
-        const defs = svg.append('defs');
-        defs
-            .append('marker')
-            .attr('id', ARROW_MARKER_ID)
-            .attr('viewBox', '0 0 10 10')
-            .attr('refX', 5)
-            .attr('refY', 5)
-            .attr('markerWidth', 6)
-            .attr('markerHeight', 6)
-            .attr('orient', 'auto-start-reverse')
-            .append('path')
-            .attr('d', 'M 0 0 L 10 5 L 0 10 z')
-            .attr('fill', 'rgba(34, 197, 94, 0.6)');
-
-        const g = svg.append('g').attr('transform', `translate(${MARGIN.left}, ${MARGIN.top})`);
-
-        const activityRenderMap = new Map<string, { index: number; startX: number; endX: number }>();
-
-        activities.forEach((activity, index) => {
-            const start = parseP6Date(activity.early_start_date);
-            const end = parseP6Date(activity.early_end_date);
-            const isCritical = Number(activity.total_float) <= 0;
-
-            const x = xScale(start);
-            const w = Math.max(MIN_BAR_WIDTH, xScale(end) - x);
-            const y = index * ROW_HEIGHT;
-
-            g.append('rect')
-                .attr('x', 0)
-                .attr('y', y)
-                .attr('width', chartWidth)
-                .attr('height', ROW_HEIGHT)
-                .attr('fill', index % 2 === 0 ? 'rgba(15, 23, 42, 0.3)' : 'rgba(30, 41, 59, 0.3)')
-                .attr('opacity', 0.4);
-
-            g.append('rect')
-                .attr('x', x)
-                .attr('y', y + 6)
-                .attr('width', w)
-                .attr('height', ROW_HEIGHT - 12)
-                .attr('rx', 6)
-                .attr('ry', 6)
-                .attr('fill', isCritical ? '#ef4444' : '#22c55e')
-                .attr('opacity', isCritical ? 0.9 : 0.8)
-                .attr('stroke', isCritical ? '#dc2626' : '#16a34a')
-                .attr('stroke-width', 1)
-                .attr('data-task-id', activity.task_id)
-                .attr('class', 'gantt-bar')
-                .style('cursor', 'pointer')
-                .on('mouseover', function() {
-                    select(this).attr('opacity', 1).attr('stroke-width', 2);
-                })
-                .on('mouseout', function() {
-                    select(this).attr('opacity', isCritical ? 0.9 : 0.8).attr('stroke-width', 1);
-                });
-
-            activityRenderMap.set(activity.task_id, {
-                index,
-                startX: x,
-                endX: x + w,
-            });
-        });
-
-        g.append('line')
-            .attr('x1', 0)
-            .attr('x2', chartWidth)
-            .attr('y1', 0)
-            .attr('y2', 0)
-            .attr('stroke', 'rgba(34, 197, 94, 0.3)')
-            .attr('stroke-width', 2);
-
-        const weekly = timeDay.every(7) ?? timeDay;
-        const tickDays = xScale.ticks(weekly);
-        const ticks = g.selectAll('.x-tick').data(tickDays).enter();
-        
-        ticks
-            .append('line')
-            .attr('class', 'x-tick-line')
-            .attr('x1', d => xScale(d))
-            .attr('x2', d => xScale(d))
-            .attr('y1', 0)
-            .attr('y2', chartHeight)
-            .attr('stroke', 'rgba(34, 197, 94, 0.1)')
-            .attr('stroke-width', 1)
-            .lower();
-
-        ticks
-            .append('text')
-            .attr('class', 'x-tick')
-            .attr('x', d => xScale(d))
-            .attr('y', -8)
-            .attr('fill', '#94a3b8')
-            .attr('font-size', 11)
-            .attr('font-weight', '600')
-            .attr('text-anchor', 'middle')
-            .text(d => DATE_FORMAT(d));
-
-        if (relationships.length > 0) {
-            const linesG = g.append('g').attr('class', 'dependency-lines');
-            relationships.forEach(rel => {
-                const pred = activityRenderMap.get(rel.pred_task_id);
-                const succ = activityRenderMap.get(rel.task_id);
-                if (!pred || !succ) return;
-
-                const predY = pred.index * ROW_HEIGHT + ROW_HEIGHT / 2;
-                const succY = succ.index * ROW_HEIGHT + ROW_HEIGHT / 2;
-                const predX = pred.endX;
-                const succX = succ.startX;
-                const offset = 10;
-
-                const d = `M ${predX} ${predY} L ${predX + offset} ${predY} L ${predX + offset} ${succY} L ${succX} ${succY}`;
-                linesG
-                    .append('path')
-                    .attr('d', d)
-                    .attr('fill', 'none')
-                    .attr('stroke', 'rgba(34, 197, 94, 0.4)')
-                    .attr('stroke-width', 1.5)
-                    .attr('stroke-dasharray', '4,2')
-                    .attr('opacity', 0.6)
-                    .attr('marker-end', `url(#${ARROW_MARKER_ID})`);
-            });
-        }
-    }, [activities, relationships, xScale, chartWidth, height, activitiesCount]);
-
-    return (
-        <div ref={containerRef} className="gantt-container">
-            <div className="gantt-header">
-                <div>
-                    <h3 className="gantt-title">Gantt Chart</h3>
-                    <p className="gantt-subtitle">Scroll horizontally to view timeline</p>
-                </div>
-                {activitiesCount > 0 && (
-                    <div className="gantt-legend">
-                        <div className="legend-item">
-                            <div className="legend-color success"></div>
-                            <span className="legend-label">On Track</span>
-                        </div>
-                        <div className="legend-item">
-                            <div className="legend-color critical"></div>
-                            <span className="legend-label">Critical</span>
-                        </div>
-                    </div>
-                )}
-            </div>
-            {activitiesCount > 0 ? (
-                <div className="gantt-chart-wrapper">
-                    <svg ref={svgRef} style={{ display: 'block', minWidth: '100%' }} />
-                </div>
-            ) : (
-                <div className="empty-state">
-                    <div className="empty-icon">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                        </svg>
-                    </div>
-                    <p className="empty-title">No activities to display</p>
-                    <p className="empty-description">Select a WBS node with activities to view the schedule</p>
-                </div>
-            )}
-        </div>
+    // create chart
+    const chart = root.container.children.push(
+      am5xy.XYChart.new(root, {
+        panX: true,
+        panY: true,
+        wheelX: "zoomX",
+        wheelY: "zoomX",
+        layout: root.horizontalLayout,
+        maxTooltipDistance: 10,
+      })
     );
+
+    // X axis (date)
+    const xAxis = chart.xAxes.push(
+      am5xy.DateAxis.new(root, {
+        baseInterval: { timeUnit: "day", count: 1 },
+        renderer: am5xy.AxisRendererX.new(root, { minGridDistance: 60 }),
+        tooltip: am5.Tooltip.new(root, {}),
+      })
+    );
+
+    // Style X axis labels and grid (Theme A - white)
+    xAxis.get("renderer").labels.template.setAll({
+      fill: am5.color(0xffffff),
+      fontSize: 11,
+      opacity: 0.95,
+    });
+    xAxis.get("renderer").grid.template.setAll({
+      stroke: am5.color(0xffffff),
+      strokeOpacity: 0.12,
+    });
+
+    // Y axis (category)
+    const yRenderer = am5xy.AxisRendererY.new(root, {
+      cellStartLocation: 0.1,
+      cellEndLocation: 0.9,
+    });
+
+    const yAxis = chart.yAxes.push(
+      am5xy.CategoryAxis.new(root, {
+        categoryField: "task",
+        renderer: yRenderer,
+        tooltip: am5.Tooltip.new(root, {}),
+      })
+    );
+
+    // Style Y axis labels and grid (Theme A - white)
+    yAxis.get("renderer").labels.template.setAll({
+      fill: am5.color(0xffffff),
+      fontSize: 12,
+      opacity: 0.95,
+    });
+    yAxis.get("renderer").grid.template.setAll({
+      stroke: am5.color(0xffffff),
+      strokeOpacity: 0.06,
+    });
+
+    // column series (gantt bars)
+    const series = chart.series.push(
+      am5xy.ColumnSeries.new(root, {
+        name: "Tasks",
+        xAxis: xAxis,
+        yAxis: yAxis,
+        openValueXField: "start",
+        valueXField: "end",
+        categoryYField: "task",
+        sequencedInterpolation: false,
+        tooltip: am5.Tooltip.new(root, {}),
+      })
+    );
+
+    series.columns.template.setAll({
+      height: 18,
+      cornerRadiusBR: 6,
+      cornerRadiusTR: 6,
+      cornerRadiusBL: 6,
+      cornerRadiusTL: 6,
+      strokeOpacity: 0.9,
+      strokeWidth: 1,
+    });
+
+    // color adapter
+    // @ts-ignore - using amCharts adapters
+    series.columns.template.adapters.add("fill", (fill: any, target: any) => {
+      const dataItem = target.dataItem;
+      return dataItem ? dataItem.get("dataContext")?.color ?? fill : fill;
+    });
+    // @ts-ignore
+    series.columns.template.adapters.add("stroke", (stroke: any, target: any) => {
+      const dataItem = target.dataItem;
+      return dataItem ? dataItem.get("dataContext")?.color ?? stroke : stroke;
+    });
+
+    // small left label bullet (name)
+    // @ts-ignore
+    series.bullets.push(function (root2: any, series2: any, dataItem: any) {
+      return am5.Bullet.new(root2, {
+        sprite: am5.Label.new(root2, {
+          text: "{name}",
+          populateText: true,
+          centerY: am5.percent(50),
+          x: 8,
+          fontSize: 12,
+          fill: am5.color(0xffffff),
+          truncate: true,
+          maxWidth: 200,
+        }),
+      });
+    });
+
+    // Add cursor for tooltip interaction (required for tooltips to work)
+    const cursor = chart.set("cursor", am5xy.XYCursor.new(root, {
+      behavior: "none",
+      xAxis: xAxis,
+    }));
+    cursor.lineX.setAll({
+      stroke: am5.color(0xffffff),
+      strokeOpacity: 0.2,
+      strokeDasharray: [5, 5],
+    });
+
+    // Configure tooltip with proper date formatting
+    const tooltip = series.get("tooltip")!;
+    tooltip.setAll({
+      getFillFromSprite: false,
+      autoTextColor: false,
+    });
+
+    // Use label adapter to format tooltip text with dates
+    tooltip.label.adapters.add("text", (text: string, target: any) => {
+      const dataItem = target.dataItem;
+      if (!dataItem) return text;
+      
+      const dataContext = dataItem.dataContext as any;
+      if (!dataContext) return text;
+
+      // Get formatted dates from the axis
+      const startDate = new Date(dataContext.start);
+      const endDate = new Date(dataContext.end);
+      const formatDate = (date: Date) => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      };
+
+      // Build tooltip text
+      const name = dataContext.name || "";
+      const task = dataContext.task || "";
+      const float = dataContext.raw?.total_float ?? "N/A";
+      const critical = dataContext.critical ? "Yes" : "No";
+    //   const duration = dataContext.raw?.duration ?? "N/A";
+    //   const calendar = dataContext.raw?.calendar_id ?? "N/A";
+
+      return `[bold]${name}[/]\n` +
+        `ID: ${task}\n` +
+        `Start: ${formatDate(startDate)}\n` +
+        `End: ${formatDate(endDate)}\n` +
+        `Float: ${float}\n` +
+        `Critical: ${critical}\n` 
+        // `Duration: ${duration}\n` +
+        // `Calendar: ${calendar}`;
+    });
+
+    // Style tooltip
+    tooltip.get("background")!.setAll({
+      fill: am5.color(0x1e293b),
+      fillOpacity: 0.95,
+      stroke: am5.color(0x10b981),
+      strokeWidth: 1,
+      cornerRadiusTL: 8,
+      cornerRadiusTR: 8,
+      cornerRadiusBL: 8,
+      cornerRadiusBR: 8,
+    });
+    tooltip.label.setAll({
+      fill: am5.color(0xffffff),
+      fontSize: 12,
+      paddingTop: 8,
+      paddingBottom: 8,
+      paddingLeft: 10,
+      paddingRight: 10,
+    });
+
+    // set data
+    yAxis.data.setAll(chartData as any);
+    series.data.setAll(chartData as any);
+
+    // Fade in chart
+    chart.appear(800, 100);
+
+    // Create overlay SVG for dependency lines
+    const overlay = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    overlay.setAttribute("class", "gantt-overlay");
+    overlay.setAttribute(
+      "style",
+      "position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; overflow:visible;"
+    );
+    overlayRef.current = overlay;
+
+    if (wrapperRef.current) {
+      wrapperRef.current.style.position = wrapperRef.current.style.position || "relative";
+      wrapperRef.current.appendChild(overlay);
+    }
+
+    // helper to find column rect by task ID (search by data-task-id)
+    function getColumnRectByTaskId(taskId: string) {
+      const div = chartDivRef.current;
+      if (!div) return null;
+      // first try direct query
+      const direct = div.querySelector<SVGRectElement>(`rect[data-task-id="${taskId}"]`);
+      if (direct) return direct.getBoundingClientRect();
+
+      // fallback: choose visible rects (exclude tiny gridlines) and attempt best-effort match by vertical proximity
+      const allRects = Array.from(div.querySelectorAll<SVGRectElement>("rect")).filter((r) => {
+        const rbox = r.getBoundingClientRect();
+        return rbox.width > 3 && rbox.height > 6;
+      });
+
+      // Heuristic fallback: try to match by vertical order using y coordinate and task index from chartData
+      const targetIndex = chartData.findIndex((d) => d.id === taskId);
+      if (targetIndex >= 0 && allRects[targetIndex]) {
+        return allRects[targetIndex].getBoundingClientRect();
+      }
+
+      // last-resort: return first rect
+      return allRects[0]?.getBoundingClientRect() ?? null;
+    }
+
+    // draw dependency lines
+    function drawDependencyLines() {
+      if (!overlayRef.current) return;
+      // clear
+      while (overlayRef.current.firstChild) overlayRef.current.removeChild(overlayRef.current.firstChild);
+
+      const overlayRect = overlayRef.current.getBoundingClientRect();
+      // add defs with arrow marker if not present
+      if (!overlayRef.current.querySelector("#gantt-arrow")) {
+        const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+        const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+        marker.setAttribute("id", "gantt-arrow");
+        marker.setAttribute("viewBox", "0 0 10 10");
+        marker.setAttribute("refX", "10");
+        marker.setAttribute("refY", "5");
+        marker.setAttribute("markerWidth", "6");
+        marker.setAttribute("markerHeight", "6");
+        marker.setAttribute("orient", "auto");
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+        path.setAttribute("fill", "rgba(255,255,255,0.85)");
+        marker.appendChild(path);
+        defs.appendChild(marker);
+        overlayRef.current.appendChild(defs);
+      }
+
+      relationships.forEach((rel) => {
+        const predRect = getColumnRectByTaskId(rel.pred_task_id);
+        const succRect = getColumnRectByTaskId(rel.task_id);
+        if (!predRect || !succRect) return;
+
+        const startX = predRect.right - overlayRect.left;
+        const startY = predRect.top + predRect.height / 2 - overlayRect.top;
+        const endX = succRect.left - overlayRect.left;
+        const endY = succRect.top + succRect.height / 2 - overlayRect.top;
+
+        const offset = 12;
+        const pathEl = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        const d = `M ${startX} ${startY} L ${startX + offset} ${startY} L ${startX + offset} ${endY} L ${endX - 6} ${endY}`;
+        pathEl.setAttribute("d", d);
+        pathEl.setAttribute("fill", "none");
+        pathEl.setAttribute("stroke", "rgba(255,255,255,0.7)");
+        pathEl.setAttribute("stroke-width", "1.6");
+        pathEl.setAttribute("stroke-linecap", "round");
+        pathEl.setAttribute("marker-end", "url(#gantt-arrow)");
+        overlayRef.current!.appendChild(pathEl);
+      });
+    }
+
+    // attempt to assign data-task-id attributes to rects for more reliable mapping
+    const assignRectIds = () => {
+      const div = chartDivRef.current;
+      if (!div) return;
+      const rects = Array.from(div.querySelectorAll<SVGRectElement>("rect")).filter((r) => {
+        const rbox = r.getBoundingClientRect();
+        return rbox.width > 3 && rbox.height > 6;
+      });
+
+      // naive assignment: match in order
+      chartData.forEach((d, idx) => {
+        const r = rects[idx];
+        if (r && !r.getAttribute("data-task-id")) {
+          r.setAttribute("data-task-id", String(d.id));
+        }
+      });
+    };
+
+    // redraw & assign with slight delay to let amcharts place DOM
+    const redrawWithDelay = () => {
+      setTimeout(() => {
+        try {
+          assignRectIds();
+        } catch (e) {
+          // ignore
+        }
+        drawDependencyLines();
+        // hide loader after initial draw
+        setLoading(false);
+      }, 220);
+    };
+
+    // initial call
+    redrawWithDelay();
+
+    // update overlay on chart interactions / resize
+    const onRangeChange = () => {
+      drawDependencyLines();
+    };
+    xAxis.events.on("rangechanged", onRangeChange);
+    yAxis.events.on("rangechanged", onRangeChange);
+    chart.events.on("boundschanged", onRangeChange);
+    series.events.on("datavalidated", redrawWithDelay);
+
+    const ro = new ResizeObserver(() => {
+      drawDependencyLines();
+    });
+    if (wrapperRef.current) ro.observe(wrapperRef.current);
+
+    // cleanup on unmount
+    return () => {
+      try {
+        xAxis.events.off("rangechanged", onRangeChange);
+        yAxis.events.off("rangechanged", onRangeChange);
+        chart.events.off("boundschanged", onRangeChange);
+        series.events.off("datavalidated", redrawWithDelay);
+        ro.disconnect();
+      } catch (e) {
+        /* ignore */
+      }
+
+      if (overlayRef.current && overlayRef.current.parentElement) {
+        overlayRef.current.parentElement.removeChild(overlayRef.current);
+      }
+      overlayRef.current = null;
+
+      try {
+        root.dispose();
+      } catch (e) {
+        /* ignore */
+      }
+      amRootRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getAm5, getAm5xy, getAm5themes, JSON.stringify(chartData), JSON.stringify(relationships)]);
+
+  return (
+    <div className="gantt-wrapper" ref={wrapperRef}>
+      <div className="gantt-header">
+        <div>
+          <h3 className="gantt-title">Gantt Chart</h3>
+          <p className="gantt-subtitle">Scroll horizontally to view timeline</p>
+        </div>
+        {/* <div className="gantt-legend">
+          <div className="legend-item">
+            <div className="legend-color success" />
+            <span className="legend-label">On Track</span>
+          </div>
+          <div className="legend-item">
+            <div className="legend-color critical" />
+            <span className="legend-label">Critical</span>
+          </div>
+        </div> */}
+      </div>
+
+      <div className="gantt-chart-area" style={{ height: "420px", position: "relative" }}>
+        {loading && (
+          <div className="gantt-loading" role="status" aria-live="polite">
+            <div className="gantt-spinner" />
+          </div>
+        )}
+
+        <div ref={chartDivRef} style={{ width: "100%", height: "100%" }} />
+        {/* overlay appended dynamically into wrapperRef */}
+      </div>
+    </div>
+  );
 };
 
 export default GanttChart;

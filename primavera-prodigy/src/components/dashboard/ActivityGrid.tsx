@@ -11,7 +11,7 @@ import type { P6Activity } from '../../lib/xer-parser/types';
 const columnHelper = createColumnHelper<P6Activity>();
 
 // Memoized table row component for performance
-const TableRow = memo(({ row, columns }: { row: any; columns: any }) => (
+const TableRow = (({ row, columns }: { row: any; columns: any }) => (
     <tr>
         {row.getVisibleCells().map((cell: any) => (
             <td 
@@ -24,7 +24,7 @@ const TableRow = memo(({ row, columns }: { row: any; columns: any }) => (
     </tr>
 ));
 
-TableRow.displayName = 'TableRow';
+// TableRow.displayName = 'TableRow';
 
 // Define table columns
 const columns = [
@@ -95,7 +95,7 @@ const ActivityGrid: React.FC = () => {
     });
 
     // Memoize rows to prevent unnecessary re-renders
-    const rows = useMemo(() => table.getRowModel().rows, [table]);
+    const rows = table.getRowModel().rows;
 
     if (data.length === 0) {
         return (

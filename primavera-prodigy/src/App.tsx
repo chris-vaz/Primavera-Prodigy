@@ -137,14 +137,12 @@ function App() {
                   onClick={() => setActiveTab('activities')}
                   className={`tab-button ${activeTab === 'activities' ? 'active' : ''}`}
                 >
-                  <span className="tab-icon">📋</span>
                   <span>Activities</span>
                 </button>
                 <button
                   onClick={() => setActiveTab('gantt')}
                   className={`tab-button ${activeTab === 'gantt' ? 'active' : ''}`}
                 >
-                  <span className="tab-icon">📊</span>
                   <span>Gantt Chart</span>
                 </button>
               </div>
